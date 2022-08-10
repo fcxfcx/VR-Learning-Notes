@@ -563,3 +563,129 @@ AFRAME.registerSystem("networked", {
  }
 ```
 
+在注册完这些同名的component之后，system会对它们进行统一的逻辑处理，即更新它们的必要信息。这一步的操作是在生命周期中的`tick`函数中运行的，tick函数会在每帧被调用，因此这部分的代码不应该生成过多的新变量，否则会造成garbage collection方面的问题。这里的代码如下所示：
+
+```javascript
+tick: (function() {
+
+  return function() {
+    if (!NAF.connection.adapter) return;
+    if (this.el.clock.elapsedTime < this.nextSyncTime) return;
+
+    // "d" is an array of entity datas per entity in this.components.
+    const data = { d: [] };
+
+    for (let i = 0, l = this.components.length; i < l; i++) {
+      const c = this.components[i];
+      if (!c.isMine()) continue;
+      if (!c.el.parentElement) {
+        NAF.log.error("entity registered with system despite being removed");
+        //TODO: Find out why tick is still being called
+        return;
+      }
+
+      const syncData = this.components[i].syncDirty();
+      if (!syncData) continue;
+
+      data.d.push(syncData);
+    }
+
+    if (data.d.length > 0) {
+      NAF.connection.broadcastData('um', data);
+    }
+
+    this.updateNextSyncTime();
+  };
+})(),
+
+updateNextSyncTime() {
+  this.nextSyncTime = this.el.clock.elapsedTime + 1 / NAF.options.updateRate;
+}
+```
+
+这里可以看到，首先在tick中会进行两个判断，如果未配置adapter则不进行任何操作直接返回，而第二个判断则是表明如果未到我们设置的更新时间（避免一个帧更新一次，消耗过多的算力资源），则也直接返回，这里维护了一个`nextSyncTime`，这个变量是在每一次更新的最后使用`updateNextSyncTime()`方法进行更新和维护的，即当前已运行的时间加上我们设置的更新周期，这个周期是使用1除以更新率计算的。如果当前时间还未到下一次更新时间点，则直接返回。
+
+之后的操作是遍历之前已经注册好的compnent数组（实际上存储的是一批entity），并且判断entity是否为当前用户所拥有（根据clientID来判断），之后判断该entity是否有父element（对于aframe的实体来说至少会有`<a-scene>`），满足条件后，则会调用component中的`syncDirty()`方法去读取某个entity中的数据，并且将数据存入事先声明的data对象中，这个方法是在之后的同名组件中声明的，可以在之后详细去看。最后如果data中含有了数据，则通过`NetworkConnection`类中的`broadcastData()`方法进行发送，可以想象，这一步是在connection那一层于adapter进行对接，如果去看具体的代码会发现果不其然，在`NetworkConnection`类中调用了adapter中的同名方法，而在adapter中则进行了如下操作：
+
+```javascript
+broadcastData(dataType, data) {
+  var roomOccupants = this.easyrtc.getRoomOccupantsAsMap(this.room);
+
+  // Iterate over the keys of the easyrtc room occupants map.
+  // getRoomOccupantsAsArray uses Object.keys which allocates memory.
+  for (var roomOccupant in roomOccupants) {
+    if (
+      roomOccupants[roomOccupant] &&
+      roomOccupant !== this.easyrtc.myEasyrtcid
+    ) {
+      // send via webrtc otherwise fallback to websockets
+      this.easyrtc.sendData(roomOccupant, dataType, data);
+    }
+  }
+}
+```
+
+这里同样是以easyrtc的adapter为例，通过`getRoomOccupantsAsMap()`可以获得在房间内所有的peer连接，以map的形式存储，之后遍历map并通过adapter提供的`sendData()`方法（可以理解为非音视频信息的通道）为每一个连接发送。至此就看完了`networked`组件所对应的同名system的结构，它的主要目的就是统一管理所有附有`networked`组件的entity，并且在tick中进行统一更新的操作（但是并不是每个tick都更新）。之后我们就可以进入到`networked`组件本身的代码中去看它的设计，并且这里还有一个从组件中获取需要同步的信息的方法，即`syncDirty()`方法，需要在组件代码中寻找具体实现。首先我们从`networked`组件的schema开始看起：
+
+```javascript
+schema: {
+  template: {default: ''},
+  attachTemplateToLocal: { default: true },
+  persistent: { default: false },
+
+  networkId: {default: ''},
+  owner: {default: ''},
+  creator: {default: ''}
+},
+```
+
+根据官方文档我们知道，`template`的作用是作为css选择器去选择需要同步的entity所对应的`<a-asset>`，而`attachTemplateToLocal`属性在文档中讲的较为模糊，之后可以根据具体的方法进行分析，最后`persistent`属性设置的是当远程用户断开时是否尝试去获取对方拥有的entity并归为自己拥有，这样就不会删除它们了。之后去看init函数中的操作，这部分的代码比较多，因为涉及到很多所需变量的初始化（例如在更新时所需要的一些坐标数据和欧拉角等）和事件的初始化，之后会根据该组件的`template`属性利用`NAF.schema.getComponents()`获取同一template下的所有entity（这个方法的源码见Schema.js），并且构建一个等长度的空数组作为缓存用的数据结构。
+
+之后通过`initNetworkParent()`方法构建父元素的结构树，即判断该component加持下的entity是否有也含有`networked`组件的父元素，如果有的话则作为变量传入这个entity，以便之后的更新逻辑使用。再后，会通过随机数生成该entity的network id，这个id同时也是该entity的name的值。
+
+如果当前组件所附加的entity是由网络产生的（即并非一开始就存在于场景中，而是通过`NetworkEntity`中的addNetworkComponent方法添加的），则需要调用`firstUpdate()`方法进行第一次的更新，而`attachTemplateToLocal()`方法也是在此处调用的，观察它的源码可以发现其功能是将目前处理的entity赋予其template（在创造的时候通过schema传入）的名称和值，这个template的具体信息是从`Schema.js`中的缓存取出的，这对应着我们通过`NAF.schemas.add()`操作添加template的过程（实际上就是在创造缓存）。因此如果我们将`attachTemplateToLocal`属性置为true，则该entity所对应的template会始终更新为缓存中的同名template。
+
+在配置好一系列的准备工作后，init函数最终会触发connected事件（如果还没有clientID就视为未连接好，但是还是会先注册触发器函数），entityCreated事件和instantiated事件，这些事件的主要目的是输出一些信息在console中以供开发者清楚的知晓运行进度。最后，将处理的entity注册到system中，供system统一管理。在这里我们顺便看一下`syncDirty()`方法是如何从entity中提取需要同步的数据的：
+
+```javascript
+syncDirty: function() {
+  if (!this.canSync()) {
+    return;
+  }
+
+  var components = this.gatherComponentsData(false);
+
+  if (components === null) {
+    return;
+  }
+
+  return this.createSyncData(components);
+},
+```
+
+首先会判定是否可以同步，这个判定条件有两个满足的情况：
+
+- 当前用户是entity的拥有者
+- 当前用户是entity的创造者，但是其拥有者已经退出了房间
+
+之后通过`gatherComponentsData()`方法，首先根据当前处理的entity的template名称，去寻找template中定义的所需要同步的component有哪些（注意，这里的component值得往往是类似position和rotation这种属性类的组件），然后根据这些组件的名称去获取当前entity中对应的attribute，这样就可以进一步的通过attribute去获得我们想要的value了。当然在发送前，还需要经过`createSyncData()`的包装，使这一组数据不仅仅有需要更新的数据信息，还有更多的关于网络的设置等信息，具体可以参考其代码：
+
+```javascript
+createSyncData: function(components, isFirstSync) {
+  var { syncData, data } = this;
+  syncData.networkId = data.networkId;
+  syncData.owner = data.owner;
+  syncData.creator = data.creator;
+  syncData.lastOwnerTime = this.lastOwnerTime;
+  syncData.template = data.template;
+  syncData.persistent = data.persistent;
+  syncData.parent = this.getParentId();
+  syncData.components = components;
+  syncData.isFirstSync = !!isFirstSync;
+  return syncData;
+},
+```
+
+实际上在networked组件中也有tick方法，其中定义的是检查网络更新的数据是否valid，例如空值就会被认为是invalid的操作，如果产生了这种操作则会以log予以警示。此外，在本地执行更新的时候，使用了[buffered-interpolation](https://github.com/InfiniteLee/buffered-interpolation)库使得更新过程更加平滑。
+
+尽管networked组件的代码较为复杂，但是我们可以总结一下其中的一些关键逻辑，例如本地的变化被采集后通过包装并贴上标签（例如u,um和r，详见NetworkConnection.js的第2行），通过adapter的数据通道发送到每个peer中，而在接受过程中，首先是在NetworkConnection中注册了每种标签对应的方法，例如um(upadate multi)标签就被对应到了entity的`updateMulti()`方法中，而这个方法是在NetworkEntities.js中实现的，其调用了我们现在正在谈论的networked组件中的`networkUpdate()`方法。更抽象一些来说，对接最外层网络通信的始终是adapter，而反馈在NAF场景中的始终是entity或者说其组件相关的代码。
